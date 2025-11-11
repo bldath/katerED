@@ -153,7 +153,7 @@ public:
 
 	void
 	registerRecViewDerived(std::vector<std::pair<std::string, std::unique_ptr<RegExp>>> defs,
-			       const yy::location &loc);
+			       std::string codeToPrint, const yy::location &loc);
 
 	// Handle "assert c" declaration in the input file
 	void registerAssert(std::unique_ptr<AssertStatement> assrt)

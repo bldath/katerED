@@ -6,6 +6,11 @@ released.
 
 ## [Unreleased]
 
+## [0.3.1] - 2025.11.11
+### Changed
+
+- Code export for GenMC updated (v0.14.1)
+
 ## [0.3] - 2024.09.03
 ### Added
 

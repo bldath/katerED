@@ -12,17 +12,18 @@ let relseq = [REL] ; ([F|TC] ; po)? ; (rf ; rmw)*
 let sw_to_r = relseq ; rf ; [ACQ]
 let sw_to_f = relseq ; rf ; po ; [F|TJ] ; [ACQ]
 let sw = sw_to_r | sw_to_f
-let asw = tc | tj
+let asw = tc | tj | lin
 
 assert sw = [REL] ; ([F|TC] ; po)? ; (rf ; rmw)* ; rf ; (po ; [F|TJ])? ; [ACQ]
 
-// Optimized calculation of happens-before.
-// Save the part of `hb` that does not finish with a reads-from edge
-
-view hb_stable = (po | (sw_to_r | asw) ; po | sw_to_f)+
-let hb = hb_stable | hb_stable? ; (sw_to_r | asw)
+// Happens-before
+view hb = (po | sw_to_r | asw | sw_to_f)+
 
 assert hb = (po | sw | asw)+
+
+// Also save an 'abstract' hb that discards plock synchronization (relinche)
+view hbRelinche = (po | tc | tj | lin
+	| (relseq ; rf ; (po ; [F|TJ|TB])? ; [NPLK & ACQ]))+ (genmc: "if (!getConf()->collectLinSpec && !getConf()->checkLinSpec) lab->addView({}); else")
 
 // ---------------------------------------------------------------------
 // IMM Consistency axioms
@@ -41,7 +42,7 @@ let ppo = [DEP] ; (deps | rfi)+ ; [W] | bob | detour
 // acyclic (ppo | rf)
 
 // Coherence : Optimize the checking of irreflexive (hb ; eco)
-export coherence hb_stable
+export coherence hb
 
 // RMW atomicity
 // check  mo-imm ; [UW] <= rf ; po-imm
@@ -67,6 +68,6 @@ export acyclic ar
 // ---------------------------------------------------------------------
 
 let ww_conflict = [W] ; loc-overlap ; [W]
-view porf_stable = (po | (rf | tc | tj); po)+
+view porf = (po | rf | tc | tj | lin)+
 
-export warning VE_WWRace        unless  ww_conflict <= porf_stable
+export warning VE_WWRace        unless  ww_conflict <= porf

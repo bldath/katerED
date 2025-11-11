@@ -828,11 +828,11 @@ auto containsMandatoryRegistrations(const KatModule &module) -> bool
 	}
 	auto hb = module.getHBDeclaration();
 	if (!hb) {
-		std::cerr << "[Error] No top-level hb_stable definition provided\n";
+		std::cerr << "[Error] No top-level hb definition provided\n";
 		return false;
 	}
 	if (!dynamic_cast<const ViewExp *>(hb->getSaved())) {
-		std::cerr << "[Error] hb_stable needs to be stored in a view\n";
+		std::cerr << "[Error] hb needs to be stored in a view\n";
 		return false;
 	}
 	auto coh = module.getCOHDeclaration();
@@ -995,7 +995,7 @@ auto Kater::checkExportRequirements() -> bool
 		module.getTheory().clearTempAssumes();
 	}
 
-	/* Ensure that all saved relations are included in pporf;ppo and are transitive */
+	/* Ensure that all saved relations are included in pporf and are transitive */
 	auto *ppo = module.getPPODeclaration()->getRE();
 	for (auto &let : module.lets()) {
 		if (dynamic_cast<const NoSavedExp *>(let->getSaved()))
@@ -1003,14 +1003,12 @@ auto Kater::checkExportRequirements() -> bool
 
 		Counterexample cex;
 		if (!dynamic_cast<const ViewExp *>(let->getSaved())) {
-			auto savedInPO = SubsetConstraint::create(
-				let->getRE()->clone(),
-				StarRE::createOpt(SeqRE::createOpt(
-					StarRE::createOpt(pporf->clone()), ppo->clone())),
-				false, false);
+			auto savedInPO = SubsetConstraint::create(let->getRE()->clone(),
+								  StarRE::createOpt(pporf->clone()),
+								  false, false);
 			auto result = checkAssertion(*savedInPO);
 			if (!result.result) {
-				std::cerr << "[Error] Saved relation not included in pporf;ppo: "
+				std::cerr << "[Error] Saved relation not included in pporf: "
 					  << *let->getRE() << "\n";
 				printCounterexample(result.cex);
 				status = false;
@@ -1018,14 +1016,12 @@ auto Kater::checkExportRequirements() -> bool
 		} else {
 			auto savedInPO = SubsetConstraint::create(
 				let->getRE()->clone(),
-				AltRE::createOpt(
-					SeqRE::createOpt(StarRE::createOpt(module.createPORF()),
-							 module.getRegisteredRE("po")->clone()),
-					RegExp::createId()),
+				AltRE::createOpt(StarRE::createOpt(module.createPORF()),
+						 RegExp::createId()),
 				false, false);
 			auto result = checkAssertion(*savedInPO);
 			if (!result.result) {
-				std::cerr << "[Error] View not included in porf;po | id: "
+				std::cerr << "[Error] View not included in porf | id: "
 					  << *let->getRE() << "\n";
 				printCounterexample(result.cex);
 				status = false;
@@ -1103,14 +1099,32 @@ template <typename F> void foreachTrailingTransBuiltin(std::unique_ptr<RegExp> &
 
 /*
  * Given the definition of a recursive expression r,
- * returns all builtins b such that r = r?;A;...;b+
+ * returns all builtins b such that r ~ r?;A;...;b+
+ * Quits if r is not of the form r ~ r1;A;...;b+ | ... | rN;A;...;b+
  */
 auto collectTrailingTransBuiltins(Relation rel, std::unique_ptr<RegExp> &re)
 	-> VSet<std::unique_ptr<CharRE>>
 {
+	/* Helper function to determine whether we should collect trailing builtins */
+	auto collectSeqREs = [&](std::unique_ptr<RegExp> &re) {
+		std::vector<const SeqRE *> res;
+		if (auto *seqRE = dynamic_cast<const SeqRE *>(&*re)) {
+			res.push_back(seqRE);
+			return res;
+		}
+		auto *altRE = dynamic_cast<const AltRE *>(&*re);
+		if (!altRE || std::ranges::any_of(altRE->kids(), [](auto &kid) {
+			    return !dynamic_cast<const SeqRE *>(&*kid);
+		    }))
+			return res;
+		for (auto &k : altRE->kids())
+			res.push_back(dynamic_cast<const SeqRE *>(&*k));
+		return res;
+	};
+
 	/* If it's not a sequence, quit */
-	auto *seqRE = dynamic_cast<const SeqRE *>(&*re);
-	if (!seqRE)
+	auto seqs = collectSeqREs(re);
+	if (seqs.empty())
 		return {};
 
 	/* Otherwise, collect CharRE UPs, as we might want to edit those REs in place later */
@@ -1122,15 +1136,18 @@ auto collectTrailingTransBuiltins(Relation rel, std::unique_ptr<RegExp> &re)
 			dynamic_cast<CharRE *>(re->getKid(0)->clone().release())));
 	};
 
-	/* If r is a sequence, it has to start with r or r? (i.e., be recursive) */
-	if (auto *charRE = dynamic_cast<const CharRE *>(seqRE->getKid(0))) {
-		if (charRE->isRelation() && *charRE->getLabel().getRelation() == rel)
-			foreachTrailingTransBuiltin(re->getKid(1), collectTrailingFun);
-	}
-	if (auto *qmarkRE = dynamic_cast<const QMarkRE *>(seqRE->getKid(0))) {
-		auto *charRE = dynamic_cast<const CharRE *>(qmarkRE->getKid(0));
-		if (charRE && charRE->isRelation() && *charRE->getLabel().getRelation() == rel)
-			foreachTrailingTransBuiltin(re->getKid(1), collectTrailingFun);
+	for (auto *seqRE : seqs) {
+		/* If r is a sequence, it has to start with r or r? (i.e., be recursive) */
+		if (auto *charRE = dynamic_cast<const CharRE *>(seqRE->getKid(0))) {
+			if (charRE->isRelation() && *charRE->getLabel().getRelation() == rel)
+				foreachTrailingTransBuiltin(re->getKid(1), collectTrailingFun);
+		}
+		if (auto *qmarkRE = dynamic_cast<const QMarkRE *>(seqRE->getKid(0))) {
+			auto *charRE = dynamic_cast<const CharRE *>(qmarkRE->getKid(0));
+			if (charRE && charRE->isRelation() &&
+			    *charRE->getLabel().getRelation() == rel)
+				foreachTrailingTransBuiltin(re->getKid(1), collectTrailingFun);
+		}
 	}
 	return result;
 }

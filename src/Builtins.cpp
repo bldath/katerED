@@ -167,6 +167,13 @@ static const std::unordered_map<Relation::BuiltinID, RelationInfo> builtinRelati
 	  .dom = {Predicate::createBuiltin(PB::TE)},
 	  .codom = {Predicate::createBuiltin(PB::TJ)},
 	  .genmc = {"tj_succ", "tj_pred"}}},
+	{RB::lin,
+	 {.name = "lin",
+	  .arity = RelArity::ManyMany,
+	  .locInfo = RelLocInfo::ChangesLoc,
+	  .dom = {Predicate::createBuiltin(PB::ME)},
+	  .codom = {Predicate::createBuiltin(PB::MB)},
+	  .genmc = {"lin_succs", "lin_preds"}}},
 	{RB::mo_imm,
 	 {.name = "mo-imm",
 	  .arity = RelArity::OneOne,
@@ -257,44 +264,59 @@ static const std::unordered_map<Predicate::BuiltinID, PredicateInfo> builtinPred
 	{PB::REL, {"REL", "#->isAtLeastRelease()"}},
 	{PB::SC, {"SC", "#->isSC()"}},
 
-	{PB::R, {"R", "llvm::isa<ReadLabel>(#)"}},
-	{PB::W, {"W", "llvm::isa<WriteLabel>(#)"}},
+	{PB::R, {"R", "genmc::isa<ReadLabel>(#)"}},
+	{PB::W, {"W", "genmc::isa<WriteLabel>(#)"}},
 
 	{PB::EXCL,
-	 {"EXCL", "((llvm::isa<ReadLabel>(#) && g.isRMWLoad(#)) || (llvm::isa<WriteLabel>(#) && "
-		  "g.isRMWStore(#)))"}},
+	 {"EXCL", "((genmc::isa<ReadLabel>(#) && genmc::dyn_cast<ReadLabel>(#)->isRMW()) || "
+		  "(genmc::isa<WriteLabel>(#) && "
+		  "genmc::dyn_cast<WriteLabel>(#)->isRMW()))"}},
 	{PB::NEXCL,
-	 {"NEXCL", "!((llvm::isa<ReadLabel>(#) && g.isRMWLoad(#)) || (llvm::isa<WriteLabel>(#) && "
-		   "g.isRMWStore(#)))"}},
+	 {"NEXCL", "!((genmc::isa<ReadLabel>(#) && genmc::dyn_cast<ReadLabel>(#)->isRMW()) || "
+		   "(genmc::isa<WriteLabel>(#) && "
+		   "genmc::dyn_cast<WriteLabel>(#)->isRMW()))"}},
 
-	{PB::F, {"F", "llvm::isa<FenceLabel>(#)"}},
+	{PB::F, {"F", "genmc::isa<FenceLabel>(#)"}},
 
-	{PB::TC, {"TC", "llvm::isa<ThreadCreateLabel>(#)"}},
-	{PB::TB, {"TB", "llvm::isa<ThreadStartLabel>(#)"}},
-	{PB::TJ, {"TJ", "llvm::isa<ThreadJoinLabel>(#)"}},
-	{PB::TK, {"TK", "llvm::isa<ThreadKillLabel>(#)"}},
-	{PB::TE, {"TE", "llvm::isa<ThreadFinishLabel>(#)"}},
+	{PB::TC, {"TC", "genmc::isa<ThreadCreateLabel>(#)"}},
+	{PB::TB, {"TB", "genmc::isa<ThreadStartLabel>(#)"}},
+	{PB::TJ, {"TJ", "genmc::isa<ThreadJoinLabel>(#)"}},
+	{PB::TK, {"TK", "genmc::isa<ThreadKillLabel>(#)"}},
+	{PB::TE, {"TE", "genmc::isa<ThreadFinishLabel>(#)"}},
 
-	{PB::ALLOC, {"ALLOC", "llvm::isa<MallocLabel>(#)"}},
-	{PB::FREE, {"FREE", "llvm::isa<FreeLabel>(#) && !llvm::isa<HpRetireLabel>(#)"}},
-	{PB::HPRET, {"HPRET", "llvm::isa<HpRetireLabel>(#)"}},
-	{PB::HPPROT, {"HPPROT", "llvm::isa<HpProtectLabel>(#)"}},
+	{PB::ALLOC, {"ALLOC", "genmc::isa<MallocLabel>(#)"}},
+	{PB::FREE, {"FREE", "genmc::isa<FreeLabel>(#) && !genmc::isa<HpRetireLabel>(#)"}},
+	{PB::HPRET, {"HPRET", "genmc::isa<HpRetireLabel>(#)"}},
+	{PB::PROT, {"PROT", "genmc::isa<HpProtectLabel>(#)"}},
+	{PB::HPPROT,
+	 {"HPPROT", "genmc::isa<MemAccessLabel>(#) && "
+		    "genmc::dyn_cast<MemAccessLabel>(#)->getAddr().isDynamic() && "
+		    "isHazptrProtected(genmc::dyn_cast<MemAccessLabel>(#))"}},
 	{PB::NOTHPPROT,
-	 {"NOTHPPROT", "llvm::isa<MemAccessLabel>(#) && "
-		       "llvm::dyn_cast<MemAccessLabel>(#)->getAddr().isDynamic() && "
-		       "!isHazptrProtected(llvm::dyn_cast<MemAccessLabel>(#))"}},
+	 {"NOTHPPROT", "genmc::isa<MemAccessLabel>(#) && "
+		       "genmc::dyn_cast<MemAccessLabel>(#)->getAddr().isDynamic() && "
+		       "!isHazptrProtected(genmc::dyn_cast<MemAccessLabel>(#))"}},
+
+	{PB::MB, {"MB", "genmc::isa<MethodBeginLabel>(#)"}},
+	{PB::ME, {"ME", "genmc::isa<MethodEndLabel>(#)"}},
+
+	{PB::PLK, {"PLK", "genmc::isa<AbstractLockCasReadLabel>(#)"}},
+	{PB::NPLK, {"NPLK", "!(genmc::isa<AbstractLockCasReadLabel>(#))"}},
+
+	{PB::MB, {"MB", "llvm::isa<MethodBeginLabel>(#)"}},
+	{PB::ME, {"ME", "llvm::isa<MethodEndLabel>(#)"}},
 
 	{PB::HEAP,
-	 {"HEAP", "llvm::isa<MemAccessLabel>(#) && "
-		  "llvm::dyn_cast<MemAccessLabel>(#)->getAddr().isDynamic()"}},
+	 {"HEAP", "genmc::isa<MemAccessLabel>(#) && "
+		  "genmc::dyn_cast<MemAccessLabel>(#)->getAddr().isDynamic()"}},
 	{PB::REC, {"REC", "#->getThread() == g.getRecoveryRoutineId()"}},
 	{PB::D,
-	 {"D", "llvm::isa<MemAccessLabel>(#) && "
-	       "llvm::dyn_cast<MemAccessLabel>(#)->getAddr().isDurable()"}},
+	 {"D", "genmc::isa<MemAccessLabel>(#) && "
+	       "genmc::dyn_cast<MemAccessLabel>(#)->getAddr().isDurable()"}},
 	{PB::DEP, {"DEP", "#->isDependable()"}},
 	{PB::LOC,
-	 {"LOC", "(llvm::isa<MemAccessLabel(#) || llvm::isa<MallocLabel>(#) || "
-		 "llvm::isa<FreeLabel>(#) || llvm::isa<HpProtectLabel>(#))"}},
+	 {"LOC", "(genmc::isa<MemAccessLabel(#) || genmc::isa<MallocLabel>(#) || "
+		 "genmc::isa<FreeLabel>(#) || genmc::isa<HpProtectLabel>(#))"}},
 };
 
 static auto builtin_pred_begin() { return builtinPredicates.begin(); }
@@ -307,10 +329,11 @@ static auto builtin_preds() { return std::ranges::ref_view(builtinPredicates); }
 
 using DisjointPredSets = std::set<VSet<Predicate::ID>>;
 static const DisjointPredSets disjointPredSets_ = {
-	/* R, W, F, TC, TB, TE, TJ, TK, Alloc, Free */
+	/* R, W, F, TC, TB, TE, TJ, TK, Alloc, Free, MB, ME */
 	{to_underlying(PB::R), to_underlying(PB::W), to_underlying(PB::F), to_underlying(PB::TC),
 	 to_underlying(PB::TB), to_underlying(PB::TE), to_underlying(PB::TJ), to_underlying(PB::TK),
-	 to_underlying(PB::ALLOC), to_underlying(PB::FREE)},
+	 to_underlying(PB::ALLOC), to_underlying(PB::FREE), to_underlying(PB::MB),
+	 to_underlying(PB::ME)},
 
 	/* NA, RLX, {ACQ, REL} */
 	{to_underlying(PB::NA), to_underlying(PB::RLX), to_underlying(PB::ACQ)},
@@ -318,6 +341,9 @@ static const DisjointPredSets disjointPredSets_ = {
 
 	/* NEXCL, EXCL */
 	{to_underlying(PB::NEXCL), to_underlying(PB::EXCL)},
+
+	/* PLK, NPLK */
+	{to_underlying(PB::PLK), to_underlying(PB::NPLK)},
 
 	/* (TB|TJ), REL */
 	{to_underlying(PB::TB), to_underlying(PB::REL)},
@@ -327,7 +353,7 @@ static const DisjointPredSets disjointPredSets_ = {
 	{to_underlying(PB::TC), to_underlying(PB::ACQ)},
 	{to_underlying(PB::TE), to_underlying(PB::ACQ)},
 
-	/* NOTE: We don't declare e.g., W # REL because W _does_ compose with SC <= REL */
+	/* NOTE: We don't declare e.g., R # REL because R _does_ compose with SC <= REL */
 
 	/* DEP only composes w/ R,ALLOC */
 	{to_underlying(PB::DEP), to_underlying(PB::W), to_underlying(PB::F), to_underlying(PB::TC),

@@ -19,149 +19,96 @@
 #include "GenMCPrinter.hpp"
 
 #include "Config.hpp"
-#include "Error.hpp"
 #include "KatModule.hpp"
 #include "NFAUtils.hpp"
 #include "RegExpUtils.hpp"
 #include "Utils.hpp"
 
 #include <fstream>
-#include <sstream>
 
 using namespace std::literals;
 
 std::unordered_map<Relation::ID, const LetStatement *> GenMCPrinter::mutRecRelToLetMap;
 std::unordered_map<const LetStatement *, unsigned> GenMCPrinter::letToIdxMap;
 
-const char *genmcCopyright =
+const static char *genmcCopyright =
 	R"(/*
  * GenMC -- Generic Model Checking.
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 3 of the License, or
- * (at your option) any later version.
+ * This project is dual-licensed under the Apache License 2.0 and the MIT License.
+ * You may choose to use, distribute, or modify this software under either license.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * Apache License 2.0:
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, you can access it online at
- * http://www.gnu.org/licenses/gpl-3.0.html.
- *
- * Author: Michalis Kokologiannakis <michalis@mpi-sws.org>
+ * MIT License:
+ *     https://opensource.org/licenses/MIT
  */
 )";
 
-const char *katerNotice =
+const static char *katerNotice =
 	R"(/*******************************************************************************
  * CAUTION: This file is generated automatically by Kater -- DO NOT EDIT.
  *******************************************************************************/
 )";
 
-const char *coherenceFuns =
+const static char *coherenceFuns =
 	R"(
-bool #CLASS#::isWriteRfBefore(Event a, Event b)
+static auto isWriteRfBefore(const WriteLabel *wLab, const EventLabel *lab) -> bool
 {
-	auto &g = getGraph();
-	auto &before = g.getEventLabel(b)->view(#HB#);
-	if (before.contains(a))
-		return true;
-
-	const EventLabel *lab = g.getEventLabel(a);
-
-	BUG_ON(!llvm::isa<WriteLabel>(lab));
-	auto *wLab = static_cast<const WriteLabel *>(lab);
-	for (auto &rLab : wLab->readers())
-		if (before.contains(rLab.getPos()))
-			return true;
-	return false;
+	auto &before = lab->view(#HB#);
+	return before.contains(wLab->getPos()) ||
+	       std::ranges::any_of(wLab->readers(),
+				   [&](auto &rLab) { return before.contains(rLab.getPos()); });
 }
 
-std::vector<Event>
-#CLASS#::getInitRfsAtLoc(SAddr addr)
+static auto isHbOptRfBefore(const EventLabel *lab, const WriteLabel *wLab) -> bool
 {
-	std::vector<Event> result;
-
-	for (const auto &lab : labels(getGraph())) {
-		if (auto *rLab = llvm::dyn_cast<ReadLabel>(&lab))
-			if (rLab->getRf()->getPos().isInitializer() && rLab->getAddr() == addr)
-				result.push_back(rLab->getPos());
-	}
-	return result;
+	return wLab->view(#HB#).contains(lab->getPos()) ||
+	       std::ranges::any_of(wLab->readers(), [&](auto &rLab) {
+		       return rLab.view(#HB#).contains(lab->getPos());
+	       });
 }
 
-bool #CLASS#::isHbOptRfBefore(const Event e, const Event write)
+static auto splitLocMOBefore(SAddr addr, EventLabel *lab) -> ExecutionGraph::co_iterator
 {
-	auto &g = getGraph();
-	const EventLabel *lab = g.getEventLabel(write);
-
-	BUG_ON(!llvm::isa<WriteLabel>(lab));
-	auto *sLab = static_cast<const WriteLabel *>(lab);
-	if (sLab->view(#HB#).contains(e))
-		return true;
-
-	for (auto &rLab : sLab->readers()) {
-		if (rLab.view(#HB#).contains(e))
-			return true;
-	}
-	return false;
-}
-
-ExecutionGraph::co_iterator
-#CLASS#::splitLocMOBefore(SAddr addr, Event e)
-{
-	auto &g = getGraph();
-	auto rit = std::find_if(g.co_rbegin(addr), g.co_rend(addr), [&](auto &lab){
-		return isWriteRfBefore(lab.getPos(), e);
-	});
+	auto &g = *lab->getParent();
+	auto rit = std::find_if(g.co_rbegin(addr), g.co_rend(addr),
+				[&](auto &oLab) { return isWriteRfBefore(&oLab, lab); });
 	/* Convert to forward iterator, but be _really_ careful */
-	if (rit == g.co_rend(addr))
-		return g.co_begin(addr);
-	return ++ExecutionGraph::co_iterator(*rit);
+	return (rit == g.co_rend(addr)) ? g.co_begin(addr) : ++ExecutionGraph::co_iterator(*rit);
 }
 
-ExecutionGraph::co_iterator
-#CLASS#::splitLocMOAfterHb(SAddr addr, const Event read)
+static auto splitLocMOAfterHb(ReadLabel *rLab) -> ExecutionGraph::co_iterator
 {
-	auto &g = getGraph();
+	auto &g = *rLab->getParent();
+	if (std::any_of(g.init_rf_begin(rLab->getAddr()), g.init_rf_end(rLab->getAddr()),
+			[rLab](auto &rfLab) { return rfLab.view(#HB#).contains(rLab->getPos()); }))
+		return g.co_begin(rLab->getAddr());
 
-	auto initRfs = g.getInitRfsAtLoc(addr);
-	if (std::any_of(initRfs.begin(), initRfs.end(), [&read,&g](const Event &rf){
-		return g.getEventLabel(rf)->view(#HB#).contains(read);
-	}))
-		return g.co_begin(addr);
-
-	auto it = std::find_if(g.co_begin(addr), g.co_end(addr), [&](auto &lab){
-		return isHbOptRfBefore(read, lab.getPos());
-	});
-	if (it == g.co_end(addr) || it->view(#HB#).contains(read))
+	auto it = std::find_if(g.co_begin(rLab->getAddr()), g.co_end(rLab->getAddr()),
+			       [&](auto &wLab) { return isHbOptRfBefore(rLab, &wLab); });
+	if (it == g.co_end(rLab->getAddr()) || it->view(#HB#).contains(rLab->getPos()))
 		return it;
 	return ++it;
 }
 
-ExecutionGraph::co_iterator
-#CLASS#::splitLocMOAfter(SAddr addr, const Event e)
+static auto splitLocMOAfter(WriteLabel *wLab) -> ExecutionGraph::co_iterator
 {
-	auto &g = getGraph();
-	return std::find_if(g.co_begin(addr), g.co_end(addr), [&](auto &lab){
-		return isHbOptRfBefore(e, lab.getPos());
-	});
+	auto &g = *wLab->getParent();
+	return std::find_if(g.co_begin(wLab->getAddr()), g.co_end(wLab->getAddr()),
+			    [&](auto &sLab) { return isHbOptRfBefore(wLab, &sLab); });
 }
 
-std::vector<Event>
-#CLASS#::getCoherentStores(SAddr addr, Event read)
+auto #CLASS#::getCoherentStores(ReadLabel *rLab) -> std::vector<EventLabel *>
 {
-	auto &g = getGraph();
-	std::vector<Event> stores;
+	auto &g = *rLab->getParent();
+	std::vector<EventLabel *> stores;
 
 	/* Fastpath: co_max(G) is po-before R */
-	auto comax = g.co_rbegin(addr) == g.co_rend(addr) ? Event::getInit() :
-		     g.co_rbegin(addr)->getPos();
-	if (comax.thread == read.thread && comax.index < read.index)
-		return {comax};
+	auto *comaxLab = g.co_max(rLab->getAddr());
+	if (comaxLab->getThread() == rLab->getThread() && comaxLab->getIndex() < rLab->getIndex())
+		return {comaxLab};
 
 	/*
 	 * If there are no stores (rf?;hb)-before the current event
@@ -169,11 +116,11 @@ std::vector<Event>
 	 * initializer store. Otherwise, we can read from all concurrent
 	 * stores and the mo-latest of the (rf?;hb)-before stores.
 	 */
-	auto begIt = splitLocMOBefore(addr, read);
-	if (begIt == g.co_begin(addr))
-		stores.push_back(Event::getInit());
+	auto begIt = splitLocMOBefore(rLab->getAddr(), rLab);
+	if (begIt == g.co_begin(rLab->getAddr()))
+		stores.push_back(g.getInitLabel());
 	else {
-		stores.push_back((--begIt)->getPos());
+		stores.push_back(&*(--begIt));
 		++begIt;
 	}
 
@@ -182,165 +129,148 @@ std::vector<Event>
 	 * account for the possibility the read is hb-before some other
 	 * store, or some read that reads from a store.
 	 */
-	auto endIt = (isDepTracking()) ? splitLocMOAfterHb(addr, read) : g.co_end(addr);
+	auto endIt = (isDepTracking()) ? splitLocMOAfterHb(rLab) : g.co_end(rLab->getAddr());
 	std::transform(begIt, endIt, std::back_inserter(stores), [&](auto &lab){
-		return lab.getPos();
+		return &lab;
 	});
 	return stores;
 }
 
-std::vector<Event>
-#CLASS#::getMOOptRfAfter(const WriteLabel *sLab)
+static auto getMOOptRfAfter(WriteLabel *sLab) -> std::vector<EventLabel *>
 {
-	std::vector<Event> after;
-	std::vector<const ReadLabel *> rfAfter;
+	auto &g = *sLab->getParent();
+	std::vector<EventLabel *> after;
+	std::vector<ReadLabel *> rfAfter;
 
-	const auto &g = getGraph();
-	std::for_each(g.co_succ_begin(sLab), g.co_succ_end(sLab),
-		      [&](auto &wLab){
-			      after.push_back(wLab.getPos());
-			      std::transform(wLab.readers_begin(), wLab.readers_end(), std::back_inserter(rfAfter),
-			      [&](auto &rLab){ return &rLab; });
+	std::for_each(g.co_succ_begin(sLab), g.co_succ_end(sLab), [&](auto &wLab) {
+		after.push_back(&wLab);
+		std::transform(wLab.readers_begin(), wLab.readers_end(),
+			       std::back_inserter(rfAfter), [&](auto &rLab) { return &rLab; });
 	});
-	std::transform(rfAfter.begin(), rfAfter.end(), std::back_inserter(after), [](auto *rLab){
-		return rLab->getPos();
-	});
+	std::transform(rfAfter.begin(), rfAfter.end(), std::back_inserter(after),
+		       [](auto *rLab) { return rLab; });
 	return after;
 }
 
-std::vector<Event>
-#CLASS#::getMOInvOptRfAfter(const WriteLabel *sLab)
+static auto getMOInvOptRfAfter(WriteLabel *sLab) -> std::vector<EventLabel *>
 {
-	auto &g = getGraph();
-	std::vector<Event> after;
-	std::vector<const ReadLabel *> rfAfter;
+	auto &g = *sLab->getParent();
+	std::vector<EventLabel *> after;
+	std::vector<ReadLabel *> rfAfter;
 
 	/* First, add (mo;rf?)-before */
-	std::for_each(g.co_pred_begin(sLab),
-		      g.co_pred_end(sLab), [&](auto &wLab){
-			      after.push_back(wLab.getPos());
-			      std::transform(wLab.readers_begin(), wLab.readers_end(), std::back_inserter(rfAfter),
-			      [&](auto &rLab){ return &rLab; });
+	std::for_each(g.co_pred_begin(sLab), g.co_pred_end(sLab), [&](auto &wLab) {
+		after.push_back(&wLab);
+		std::transform(wLab.readers_begin(), wLab.readers_end(),
+			       std::back_inserter(rfAfter), [&](auto &rLab) { return &rLab; });
 	});
-	std::transform(rfAfter.begin(), rfAfter.end(), std::back_inserter(after), [](auto *rLab){
-		return rLab->getPos();
-	});
+	std::transform(rfAfter.begin(), rfAfter.end(), std::back_inserter(after),
+		       [](auto *rLab) { return rLab; });
 
 	/* Then, we add the reader list for the initializer */
-	auto initRfs = g.getInitRfsAtLoc(sLab->getAddr());
-	after.insert(after.end(), initRfs.begin(), initRfs.end());
+	std::for_each(g.init_rf_begin(sLab->getAddr()), g.init_rf_end(sLab->getAddr()),
+		      [&](auto &rLab) { after.insert(after.end(), &rLab); });
 	return after;
 }
 
-static std::vector<Event>
-getRevisitableFrom(const ExecutionGraph &g, const WriteLabel *sLab,
-		   const VectorClock &pporf, const WriteLabel *coPred)
+static auto getRevisitableFrom(WriteLabel *sLab, const VectorClock &pporf, WriteLabel *coPred)
+	-> std::vector<ReadLabel *>
 {
-	auto pendingRMW = g.getPendingRMW(sLab);
-	std::vector<Event> loads;
+	auto &g = *sLab->getParent();
+	const auto *confLab = findPendingRMW(sLab);
+	std::vector<ReadLabel *> loads;
 
 	for (auto &rLab : coPred->readers()) {
 		if (!pporf.contains(rLab.getPos()) && rLab.getAddr() == sLab->getAddr() &&
 		    rLab.isRevisitable() && rLab.wasAddedMax())
-			loads.push_back(rLab.getPos());
+			loads.push_back(&rLab);
 	}
-	if (!pendingRMW.isInitializer())
+	if (confLab)
 		loads.erase(std::remove_if(loads.begin(), loads.end(),
-					   [&](Event &e) {
-						   auto *confLab = g.getEventLabel(pendingRMW);
-						   return g.getEventLabel(e)->getStamp() >
-							  confLab->getStamp();
+					   [&](auto &eLab) {
+						   return eLab->getStamp() > confLab->getStamp();
 					   }),
 			    loads.end());
 	return loads;
 }
 
-std::vector<Event>
-#CLASS#::getCoherentRevisits(const WriteLabel *sLab, const VectorClock &pporf)
+void #CLASS#::filterCoherentRevisits(WriteLabel *sLab, std::vector<ReadLabel *> &ls)
 {
-	auto &g = getGraph();
-	std::vector<Event> ls;
-
-	/* Fastpath: previous co-max is ppo-before SLAB */
-	auto prevCoMaxIt = std::find_if(g.co_rbegin(sLab->getAddr()), g.co_rend(sLab->getAddr()),
-					[&](auto &lab) { return lab.getPos() != sLab->getPos(); });
-	if (prevCoMaxIt != g.co_rend(sLab->getAddr()) && pporf.contains(prevCoMaxIt->getPos())) {
-		ls = getRevisitableFrom(g, sLab, pporf, &*prevCoMaxIt);
-	} else {
-		ls = g.getRevisitable(sLab, pporf);
-	}
-
 	/* If this store is po- and mo-maximal then we are done */
-	if (!isDepTracking() && g.isCoMaximal(sLab->getAddr(), sLab->getPos()))
-		return ls;
+	auto &g = *sLab->getParent();
+	if (!isDepTracking() && sLab == g.co_max(sLab->getAddr()))
+		return;
 
 	/* First, we have to exclude (mo;rf?;hb?;sb)-after reads */
 	auto optRfs = getMOOptRfAfter(sLab);
-	ls.erase(std::remove_if(ls.begin(), ls.end(), [&](Event e)
-				{ const View &before = g.getEventLabel(e)->view(#HB#);
-				  return std::any_of(optRfs.begin(), optRfs.end(),
-					 [&](Event ev)
-					 { return before.contains(ev); });
-				}), ls.end());
+	ls.erase(std::remove_if(ls.begin(), ls.end(),
+				[&](auto &eLab) {
+					auto &before = g.po_imm_pred(eLab)->view(#HB#); // hb;sb
+					return std::any_of(
+						optRfs.begin(), optRfs.end(), [&](auto &evLab) {
+							return before.contains(evLab->getPos());
+						});
+				}),
+		 ls.end());
 
 	/* If out-of-order event addition is not supported, then we are done
 	 * due to po-maximality */
 	if (!isDepTracking())
-		return ls;
+		return;
 
 	/* Otherwise, we also have to exclude hb-before loads */
-	ls.erase(std::remove_if(ls.begin(), ls.end(), [&](Event e)
-		{ return g.getEventLabel(sLab->getPos())->view(#HB#).contains(e); }),
-		ls.end());
-
-	/* ...and also exclude (mo^-1; rf?; (hb^-1)?; sb^-1)-after reads in
-	 * the resulting graph */
-	auto &before = pporf;
-	auto moInvOptRfs = getMOInvOptRfAfter(sLab);
-	ls.erase(std::remove_if(ls.begin(), ls.end(), [&](Event e)
-				{ auto *eLab = g.getEventLabel(e);
-				  auto v = g.getViewFromStamp(eLab->getStamp());
-				  v->update(before);
-				  return std::any_of(moInvOptRfs.begin(),
-						     moInvOptRfs.end(),
-						     [&](Event ev)
-						     { return v->contains(ev) &&
-						       g.getEventLabel(ev)->view(#HB#).contains(e); });
-				}),
+	ls.erase(std::remove_if(ls.begin(), ls.end(),
+				[&](auto &eLab) { return sLab->view(#HB#).contains(eLab->getPos()); }),
 		 ls.end());
 
-	return ls;
+	/* ...and also exclude (mo^-1; rf?; (hb^-1)?; sb^-1)-after reads in the *resulting* graph */
+	auto &before = sLab->getPrefixView();
+	auto moInvOptRfs = getMOInvOptRfAfter(sLab);
+	ls.erase(std::remove_if(
+			 ls.begin(), ls.end(),
+			 [&](auto &eLab) {
+				 auto v = g.getViewFromStamp(eLab->getStamp());
+				 v->update(before);
+				 return std::any_of(
+					 moInvOptRfs.begin(), moInvOptRfs.end(), [&](auto &evLab) {
+						 return v->contains(evLab->getPos()) && // stays in graph?
+							g.po_imm_pred(evLab)->view(#HB#).contains(eLab->getPos()); // po-pred to check evLab != rLab
+					 });
+			 }),
+		 ls.end());
 }
 
-std::vector<Event>
-#CLASS#::getCoherentPlacings(SAddr addr, Event store, bool isRMW)
+auto #CLASS#::getCoherentPlacings(WriteLabel *wLab)
+	-> std::vector<EventLabel *>
 {
-	auto &g = getGraph();
-	std::vector<Event> result;
+	auto &g = *wLab->getParent();
+	std::vector<EventLabel *> result;
 
 	/* If it is an RMW store, there is only one possible position in MO */
-	if (isRMW) {
-		auto *rLab = llvm::dyn_cast<ReadLabel>(g.getEventLabel(store.prev()));
+	if (wLab->isRMW()) {
+		auto *rLab = genmc::dyn_cast<ReadLabel>(g.po_imm_pred(wLab));
 		BUG_ON(!rLab);
 		auto *rfLab = rLab->getRf();
 		BUG_ON(!rfLab);
-		result.push_back(rfLab->getPos());
+		result.push_back(rfLab);
 		return result;
 	}
 
 	/* Otherwise, we calculate the full range and add the store */
-	auto rangeBegin = splitLocMOBefore(addr, store);
-	auto rangeEnd = (isDepTracking()) ? splitLocMOAfter(addr, store) : g.co_end(addr);
-	auto cos = llvm::iterator_range(rangeBegin, rangeEnd) |
-		   std::views::filter([&](auto &sLab) { return !g.isRMWStore(sLab.getPos()); }) |
+	auto rangeBegin = splitLocMOBefore(wLab->getAddr(), wLab);
+	auto rangeEnd = (isDepTracking()) ? splitLocMOAfter(wLab) : g.co_end(wLab->getAddr());
+	auto cos = std::ranges::subrange(rangeBegin, rangeEnd) |
+		   std::views::filter([&](auto &sLab) { return !sLab.isRMW(); }) |
 		   std::views::transform([&](auto &sLab) {
 			   auto *pLab = g.co_imm_pred(&sLab);
-			   return pLab ? pLab->getPos() : Event::getInit();
+			   return pLab ? (EventLabel *)pLab : (EventLabel *)g.getInitLabel();
 		   });
 	std::ranges::copy(cos, std::back_inserter(result));
-	result.push_back(rangeEnd == g.co_end(addr)   ? g.co_max(addr)->getPos()
-			 : !g.co_imm_pred(&*rangeEnd) ? Event::getInit()
-						      : g.co_imm_pred(&*rangeEnd)->getPos());
+	result.push_back(rangeEnd == g.co_end(wLab->getAddr())
+				 ? g.co_max(wLab->getAddr())
+				 : (!g.co_imm_pred(&*rangeEnd)
+					    ? (EventLabel *)g.getInitLabel()
+					    : (EventLabel *)g.co_imm_pred(&*rangeEnd)));
 	return result;
 })";
 
@@ -368,8 +298,8 @@ struct DFSParameters {
 
 GenMCPrinter::GenMCPrinter(const KatModule &module, const Config &config) : Printer(module, config)
 {
-	className = getPrefix() + "Driver";
-	guardName = std::string("GENMC_") + getPrefix() + "_DRIVER_HPP";
+	className = getPrefix() + "Checker";
+	guardName = std::string("GENMC_") + getPrefix() + "_CHECKER_HPP";
 
 	/* Open required streams, if the user requested file printing */
 	if (!getPrefix().empty()) {
@@ -430,7 +360,7 @@ void GenMCPrinter::outputDFSCode(const NFA &nfa, const DFSParameters &params)
 		cpp() << "bool " << className << "::" << getStateFunName(&*sUP) << "("
 		      << params.params << ") const \n"
 		      << "{\n"
-		      << "\tauto &g = getGraph();\n"
+		      << "\tauto &g = *lab->getParent();\n"
 		      << "\n";
 
 		if (params.visit.at(&*sUP)) {
@@ -510,7 +440,7 @@ void GenMCPrinter::outputSCCCode(const NFA &nfa, const DFSParameters &params)
 		cpp() << "bool " << className << "::" << getStateFunName(&*sUP) << "("
 		      << params.params << ") const \n"
 		      << "{\n"
-		      << "\tauto &g = getGraph();\n"
+		      << "\tauto &g = *lab->getParent();\n"
 		      << "\n"
 		      << (sUP->isStarting() ? "\t++"s + acceptingCountName + ";\n"s : ""s);
 		if (params.visit.at(&*sUP)) {
@@ -535,7 +465,8 @@ void GenMCPrinter::outputSCCCode(const NFA &nfa, const DFSParameters &params)
 			cpp() << "\t\t\tif (!" << getStateFunName(t.dest) << "("
 			      << params.createParams("pLab") << ")){\n"
 			      << params.atReturnFalse("lab") << "\n"
-			      << "\t\t}\n";
+			      << "\t\t}\n"
+			      << "\t\t" << params.atTreeE("lab") << "\n";
 			if (params.visit.at(t.dest)) {
 				cpp() << "\t\t} else if (node.status == NodeStatus::entered && ("
 				      << acceptingCountName << " > node.count || "
@@ -554,6 +485,7 @@ void GenMCPrinter::outputSCCCode(const NFA &nfa, const DFSParameters &params)
 			cpp() << "\t" << getStateArrName(&*sUP) << "[lab->getStamp().get()] = "
 			      << "{ " << acceptingCountName << ", NodeStatus::left };\n";
 		}
+		cpp() << params.atEnd("lab") << "\n";
 		cpp() << "\treturn true;\n"
 		      << "}\n"
 		      << "\n";
@@ -665,17 +597,12 @@ void GenMCPrinter::printHeader()
 	hpp() << "#ifndef " << guardName << "\n"
 	      << "#define " << guardName << "\n"
 	      << "\n"
-	      << "#include \"config.h\"\n"
-	      << "#include \"ADT/VSet.hpp\"\n"
-	      << "#include \"ExecutionGraph/ExecutionGraph.hpp\"\n"
-	      << "#include \"ExecutionGraph/GraphIterators.hpp\"\n"
-	      << "#include \"ExecutionGraph/MaximalIterator.hpp\"\n"
-	      << "#include \"Verification/GenMCDriver.hpp\"\n"
-	      << "#include \"Verification/VerificationError.hpp\"\n"
+	      << "#include \"ExecutionGraph/Consistency/ConsistencyChecker.hpp\"\n"
+	      << "#include \"ExecutionGraph/EventLabel.hpp\"\n"
 	      << "#include <cstdint>\n"
 	      << "#include <vector>\n"
 	      << "\n"
-	      << "class " << className << " : public GenMCDriver {\n"
+	      << "class " << className << " : public ConsistencyChecker {\n"
 	      << "\n"
 	      << "private:\n"
 	      << "\tenum class NodeStatus : unsigned char { unseen, entered, "
@@ -691,51 +618,40 @@ void GenMCPrinter::printHeader()
 	      << "\t};\n"
 	      << "\n"
 	      << "public:\n"
-	      << "\t" << className
-	      << "(std::shared_ptr<const Config> conf, std::unique_ptr<llvm::Module> mod,\n"
-	      << "\t\tstd::unique_ptr<ModuleInfo> MI, GenMCDriver::Mode mode = "
-		 "GenMCDriver::VerificationMode{});\n"
-	      << "\n"
-	      << "\tvoid calculateSaved(EventLabel *lab);\n"
-	      << "\tvoid calculateViews(EventLabel *lab);\n"
-	      << "\tvoid updateMMViews(EventLabel *lab) override;\n"
-	      << "\tbool isDepTracking() const override;\n"
-	      << "\tbool isConsistent(const EventLabel *lab) const override;\n"
-	      << "\tVerificationError checkErrors(const EventLabel *lab, const EventLabel *&race) "
-		 "const override;\n"
-	      << "\tstd::vector<VerificationError> checkWarnings(const EventLabel *lab, const "
-		 "VSet<VerificationError> &seenWarnings, std::vector<const EventLabel *> "
-		 "&racyLabs) const;\n"
-	      << "\tstd::unique_ptr<VectorClock> calculatePrefixView(const EventLabel *lab) const "
-		 "override;\n"
-	      << "\tconst View &getHbView(const EventLabel *lab) const override;\n"
-	      << "\tstd::vector<Event> getCoherentStores(SAddr addr, Event read) override;\n"
-	      << "\tstd::vector<Event> getCoherentRevisits(const WriteLabel "
-		 "*sLab, const VectorClock &pporf) override;\n"
-	      << "\tstd::vector<Event> getCoherentPlacings(SAddr addr, Event store, bool isRMW) "
-		 "override;\n"
+	      << "\t" << className << "(const Config *conf) : ConsistencyChecker(conf) {};\n"
 	      << "\n"
 	      << "private:\n"
-	      << "\tbool isWriteRfBefore(Event a, Event b);\n"
-	      << "\tstd::vector<Event> getInitRfsAtLoc(SAddr addr);\n"
-	      << "\tbool isHbOptRfBefore(const Event e, const Event write);\n"
-	      << "\tExecutionGraph::co_iterator splitLocMOBefore(SAddr addr, Event e);\n"
-	      << "\tExecutionGraph::co_iterator splitLocMOAfterHb(SAddr addr, const Event read);\n"
-	      << "\tExecutionGraph::co_iterator splitLocMOAfter(SAddr addr, const Event e);\n"
-	      << "\tstd::vector<Event> getMOOptRfAfter(const WriteLabel *sLab);\n"
-	      << "\tstd::vector<Event> getMOInvOptRfAfter(const WriteLabel *sLab);\n"
+	      << "\tbool isConsistent(const EventLabel *lab) const override;\n"
+	      << "\tbool isConsistent(const ExecutionGraph &g) const override;\n"
+	      << "\tbool isCoherentRelinche(const ExecutionGraph &g) const override;\n"
+	      << "\tstd::optional<VerificationError> checkErrors(const EventLabel *lab, const "
+		 "EventLabel *&race) const;\n"
+	      << "\tstd::vector<VerificationError> checkWarnings(const EventLabel *lab, const "
+		 "VSet<VerificationError> &reported, std::vector<const EventLabel *> &races) "
+		 "const override;\n"
+	      << "\tstd::vector<EventLabel *> getCoherentStores(ReadLabel *rLab) override;\n"
+	      << "\tvoid filterCoherentRevisits(WriteLabel *sLab, std::vector<ReadLabel *> &ls) "
+		 "override;\n"
+	      << "\tstd::vector<EventLabel *> getCoherentPlacings(WriteLabel *sLab) override;\n"
+	      << "\tvoid updateMMViews(EventLabel *lab) override;\n"
+	      << "\tstd::unique_ptr<VectorClock> calculatePrefixView(const EventLabel *lab) const "
+		 "override;\n"
+	      << "\tbool isDepTracking() const;\n"
+	      << "\tvoid calculateSaved(EventLabel *lab);\n"
+	      << "\tvoid calculateViews(EventLabel *lab);\n"
 	      << "\tmutable const EventLabel *cexLab{};\n"
 	      << "\n";
 
 	/* Print all includes in the CPP file */
 	cpp() << "#include \"" << className << ".hpp\"\n"
-	      << "#include \"Static/ModuleInfo.hpp\"\n"
-	      << "\n"
-	      << className << "::" << className
-	      << "(std::shared_ptr<const Config> conf, std::unique_ptr<llvm::Module> mod,\n"
-	      << "\t\tstd::unique_ptr<ModuleInfo> MI, GenMCDriver::Mode mode /* = "
-		 "GenMCDriver::VerificationMode{} */)\n"
-	      << "\t: GenMCDriver(conf, std::move(mod), std::move(MI), mode) {}\n"
+	      << "#include \"ADT/VSet.hpp\"\n"
+	      << "#include "
+	      << (getModule().isDepTracking() ? "\"ADT/DepView.hpp\"\n"s : "\"ADT/View.hpp\"\n"s)
+	      << "#include \"ExecutionGraph/ExecutionGraph.hpp\"\n"
+	      << "#include \"ExecutionGraph/GraphIterators.hpp\"\n"
+	      << "#include \"ExecutionGraph/GraphUtils.hpp\"\n"
+	      << "#include \"Verification/Config.hpp\"\n"
+	      << "#include \"Verification/VerificationError.hpp\"\n"
 	      << "\n";
 }
 
@@ -797,7 +713,7 @@ void GenMCPrinter::output()
 		cpp() << "auto " << className << "::" << exportedName
 		      << "(const EventLabel *lab) const\n"
 		      << "{\n"
-		      << "\tauto &g = getGraph();\n"
+		      << "\tauto &g = *lab->getParent();\n"
 		      << "\n";
 		cpp() << "\treturn visit" << exportedNameSuffix << "(lab);\n}\n";
 	}
@@ -812,11 +728,13 @@ void GenMCPrinter::output()
 	cpp() << "}\n"
 	      << "\n";
 	cpp() << "void " << className << "::calculateViews(EventLabel *lab)\n"
-	      << "{\n";
+	      << "{\n"
+	      << "\tlab->setViews({});\n";
 	for (auto &let : module.lets()) {
 		if (!dynamic_cast<ViewExp *>(let->getSaved()))
 			continue;
-
+		if (let->hasCodeToPrint())
+			cpp() << *let->getCodeToPrint() << "\n";
 		cpp() << "\tlab->addView(" << exportedNames[&*let] << "(lab));\n";
 	}
 	cpp() << "}\n"
@@ -829,12 +747,6 @@ void GenMCPrinter::output()
 		cpp() << "\tlab->setPrefixView(calculatePrefixView(lab));\n";
 	}
 	cpp() << "}\n"
-	      << "\n";
-	/* hb-view getter */
-	cpp() << "const View &" << className << "::getHbView(const EventLabel *lab) const\n"
-	      << "{\n"
-	      << "\treturn lab->view(" << getPrintedIdx(module.getHBDeclaration()) << ");\n"
-	      << "}\n"
 	      << "\n";
 
 	// FIXME: Somewhere sanitize exports (unless has to be <= )
@@ -896,11 +808,13 @@ void GenMCPrinter::output()
 
 		// Finally, print a checker that combines the main routine and the unless
 		// clause, as well as GenMC-specific code
+
+		//  Incremental version:
 		hpp() << "\tbool " << exportedName << "(const EventLabel *lab) const;\n";
 		cpp() << "bool " << className << "::" << exportedName
 		      << "(const EventLabel *lab) const\n"
 		      << "{\n"
-		      << "\tauto &g = getGraph();\n"
+		      << "\tauto &g = *lab->getParent();\n"
 		      << "\n";
 		if (stmt->hasCodeToPrint())
 			cpp() << *stmt->getCodeToPrint() << "\n";
@@ -909,9 +823,18 @@ void GenMCPrinter::output()
 			      << "\t\treturn true;\n"
 			      << "\n";
 		cpp() << "\treturn visit" << exportedNameSuffix << "(lab);\n}\n";
+
+		//  Full version (currently acyclicity only):
+		if (!dynamic_cast<const AcyclicConstraint *>(stmt->getConstraint()))
+			continue;
+		hpp() << "\tbool " << exportedName << "(const ExecutionGraph &g) const;\n";
+		cpp() << "bool " << className << "::" << exportedName
+		      << "(const ExecutionGraph &g) const\n"
+		      << "{\n"
+		      << "\treturn visit" << exportedNameSuffix << "Full(g);\n}\n";
 	}
 
-	cpp() << "VerificationError " << className
+	cpp() << "std::optional<VerificationError> " << className
 	      << "::checkErrors(const EventLabel *lab, const EventLabel *&race) const\n"
 	      << "{";
 	for (auto &stmt : module.exports()) {
@@ -921,10 +844,10 @@ void GenMCPrinter::output()
 		}
 		cpp() << "\n\tif (!" << exportedNames[&*stmt] << "(lab)) {"
 		      << "\n\t\trace = cexLab;"
-		      << "\n\t\treturn VerificationError::" << errorCst->getWarningName() << ";"
+		      << "\n\t\treturn {VerificationError::" << errorCst->getWarningName() << "};"
 		      << "\n\t}\n";
 	}
-	cpp() << "\n\treturn VerificationError::VE_OK;\n"
+	cpp() << "\n\treturn {};\n"
 	      << "}\n"
 	      << "\n";
 	cpp() << "std::vector<VerificationError> " << className
@@ -952,6 +875,8 @@ void GenMCPrinter::output()
 	/************************************************************
 	 * consistency
 	 ************************************************************/
+
+	/* incremental version */
 	cpp() << "bool " << className << "::isConsistent(const EventLabel *lab) const\n"
 	      << "{\n"
 	      << "\n\treturn true";
@@ -971,6 +896,47 @@ void GenMCPrinter::output()
 		}
 		if (!stmt->isExtra())
 			cpp() << "\n\t\t&& " << exportedNames[&*stmt] << "(lab)";
+	}
+	cpp() << ";\n"
+	      << "}\n"
+	      << "\n";
+
+	/* full version */
+	cpp() << "bool " << className << "::isConsistent(const ExecutionGraph &g) const\n"
+	      << "{\n"
+	      << "\n\treturn true";
+	for (auto &stmt : module.exports()) {
+		auto *acycCst = dynamic_cast<const AcyclicConstraint *>(stmt->getConstraint());
+		if (!acycCst) {
+			continue;
+		}
+		if (!stmt->isExtra())
+			cpp() << "\n\t\t&& " << exportedNames[&*stmt] << "(g)";
+	}
+	// FIXME: for equality
+	for (auto &stmt : module.exports()) {
+		auto *subCst = dynamic_cast<const SubsetConstraint *>(stmt->getConstraint());
+		if (!subCst) {
+			continue;
+		}
+		if (!stmt->isExtra())
+			cpp() << "\n\t\t&& " << exportedNames[&*stmt] << "(g)";
+	}
+	cpp() << ";\n"
+	      << "}\n"
+	      << "\n";
+
+	/* coherence (special treatment) */
+	cpp() << "bool " << className << "::isCoherentRelinche(const ExecutionGraph &g) const\n"
+	      << "{\n"
+	      << "\n\treturn true";
+	for (auto &stmt : module.exports()) {
+		auto *cohCst = dynamic_cast<const CoherenceConstraint *>(stmt->getConstraint());
+		if (!cohCst) {
+			continue;
+		}
+		assert(!stmt->isExtra());
+		cpp() << "\n\t\t&& visitCoherenceRelinche(g)";
 	}
 	cpp() << ";\n"
 	      << "}\n"
@@ -1069,7 +1035,7 @@ void GenMCPrinter::printSubset(const SubsetConstraint *subCst, std::string prefi
 		.createParams = [&](auto &s) { return s; },
 		.atFinal =
 			[&](auto &s) {
-				return paramsLHS.status +
+				return paramsRHS.status +
 				       "Accepting[lab->getStamp().get()] = true;";
 			},
 		.atReturnFalse = [&](auto &s) { return "\t\t\treturn false;"; },
@@ -1120,7 +1086,7 @@ void GenMCPrinter::printSubset(const SubsetConstraint *subCst, std::string prefi
 	      << "visit" + prefix << "(const EventLabel *lab) const;\n";
 	cpp() << "bool " << className << "::visit" + prefix << "(const EventLabel *lab) const\n"
 	      << "{\n"
-	      << "\tauto &g = getGraph();\n"
+	      << "\tauto &g = *lab->getParent();\n"
 	      << "\n";
 	for (auto &s : nfaLHS.states() | std::views::filter([&](auto &sUP) {
 			       return paramsLHS.visit.at(&*sUP);
@@ -1179,8 +1145,8 @@ void GenMCPrinter::printSubset(const SubsetConstraint *subCst, std::string prefi
 		      << "\t\tif (" << paramsLHS.status << "Accepting[i] && !" << paramsRHS.status
 		      << "Accepting[i]) {\n";
 		if (counterexample) {
-			cpp() << "\t\t\tcexLab = &*std::find_if(label_begin(g), "
-				 "label_end(g), "
+			cpp() << "\t\t\tcexLab = &*std::find_if(g.label_begin(), "
+				 "g.label_end(), "
 				 "[&](auto &lab){ "
 				 "return "
 				 "lab.getStamp() == i; });\n";
@@ -1258,8 +1224,6 @@ void GenMCPrinter::printAcyclic(const AcyclicConstraint *acycCst, std::string pr
 	// Helper function for printing the initialization code
 
 	auto printInitializations = [&]() {
-		cpp() << "\tauto &g = getGraph();\n"
-		      << "\n";
 		cpp() << "\t" << params.status + "Accepting = 0;\n";
 		for (auto &sUP : nfa.states() | std::views::filter([&](auto &sUP) {
 					 return params.visit.at(&*sUP);
@@ -1276,7 +1240,9 @@ void GenMCPrinter::printAcyclic(const AcyclicConstraint *acycCst, std::string pr
 	      << "visit" << prefix << "(const EventLabel *lab) const;\n"
 	      << "\n";
 	cpp() << "bool " << className << "::visit" << prefix << "(const EventLabel *lab) const\n"
-	      << "{\n";
+	      << "{\n"
+	      << "\tauto &g = *lab->getParent();\n"
+	      << "\n";
 	printInitializations();
 	cpp() << "\treturn true";
 	/* Don't visit all states: for incremental checks, visit the ones you can enter with po/rf.
@@ -1311,14 +1277,15 @@ void GenMCPrinter::printAcyclic(const AcyclicConstraint *acycCst, std::string pr
 	      << "\n";
 
 	hpp() << "\tbool "
-	      << "visit" << prefix << "Full() const;\n"
+	      << "visit" << prefix << "Full(const ExecutionGraph &g) const;\n"
 	      << "\n";
-	cpp() << "bool " << className << "::visit" << prefix << "Full() const\n"
+	cpp() << "bool " << className << "::visit" << prefix
+	      << "Full(const ExecutionGraph &g) const\n"
 	      << "{\n";
 	printInitializations();
 	cpp() << "\treturn true";
 	for (auto &sUP : nfa.accepting()) {
-		cpp() << "\n\t\t&& std::ranges::all_of(labels(g), [&](auto &lab){ return ";
+		cpp() << "\n\t\t&& std::ranges::all_of(g.labels(), [&](auto &lab){ return ";
 		if (params.visit.at(&*sUP)) {
 			cpp() << params.status << "_" << params.ids.at(&*sUP)
 			      << "[lab.getStamp().get()]"
@@ -1338,65 +1305,78 @@ void GenMCPrinter::printCoherence(const CoherenceConstraint *cohCst)
 	replaceAll(s, "#HB#", std::to_string(getPrintedIdx(getModule().getCOHDeclaration())));
 	cpp() << s << "\n";
 
-	// For coherence, the procedure is very similar to the acyclicity case.
-	// In contrast to acyclicity, we don't take the reflexive-transitive closure here,
-	// but we still do a DFS
-	auto nfa = getModule().getRegisteredRE(cohCst->getID())->toNFA();
+	// For coherence, we detect violations by performing multiple DFSs (for each memory access).
+	// In contrast to acyclicity, we don't take the reflexive-transitive closure here.
+	// This is much slower, but can be optimized for Relinche.
+	// (This can potentially be optimized by taking the rotational closure of COH instead.)
+	//
+	// NOTE: As this is currently only used in Relinche, we instead print an optimized
+	//       version that checks for hbpo;eco;hbpo;lin irreflexivity.
+	const auto &module = getModule();
+	auto ecoREUP = PlusRE::createOpt(AltRE::createOpt(module.getRegisteredRE("rf")->clone(),
+							  module.getRegisteredRE("mo")->clone(),
+							  module.getRegisteredRE("fr")->clone()));
+	const auto *hbpoRE = module.getRegisteredRE(cohCst->getID());
+	auto nfa = SeqRE::createOpt(hbpoRE->clone(), ecoREUP->clone(), hbpoRE->clone(),
+				    module.getRegisteredRE("lin")->clone())
+			   ->toNFA();
+
 	simplify(nfa, getModule().getTheory());
+	// Opt: We can just get away with predecessor checks
 
 	auto prefix = "Coherence"s;
 	DFSParameters params = {
 		.name = "visit" + prefix,
 		.status = "visited" + prefix,
-		.params = "const EventLabel *lab",
+		.params = "const EventLabel *lab, const EventLabel *initLab",
 		.savedParam = "",
-		.createParams = [&](auto &s) { return s; },
+		.createParams = [&](auto &s) { return s + ", initLab"; },
 		.atBegin = [&](auto &s) { return ""; },
 		.atTreeE = [&](auto &s) { return ""; },
 		.atCyclE = [&](auto &s) { return ""; },
 		.atBackE = [&](auto &s) { return ""; },
 		.atForwE = [&](auto &s) { return ""; },
 		.atEnd = [&](auto &s) { return ""; },
-		.atFinal = [&](auto &s) { return ""; },
-		.atReturnFalse = [&](auto &s) { return "\t\t\t\treturn false;"; },
+		.atFinal = [&](auto &s) { return "if (lab == initLab) return false;"; },
+		.atReturnFalse = [&](auto &s) { return "return false;"; },
 		.ids = assignStateIDs(nfa.states_begin(), nfa.states_end()),
 		.visit = getStateVisitAssignment(nfa),
 	};
-	outputSCCCode(nfa, params);
+	outputDFSCode(nfa, params);
 
 	// Helper function for printing the initialization code
 	auto printInitializations = [&]() {
-		cpp() << "\tauto &g = getGraph();\n"
-		      << "\n";
-		cpp() << "\t" << params.status + "Accepting = 0;\n";
 		for (auto &sUP : nfa.states() | std::views::filter([&](auto &sUP) {
 					 return params.visit.at(&*sUP);
 				 })) {
-			cpp() << "\t" << params.status << "_" << params.ids.at(&*sUP)
+			cpp() << "\t\t" << params.status << "_" << params.ids.at(&*sUP)
 			      << ".clear();\n"
-			      << "\t" << params.status << "_" << params.ids.at(&*sUP)
+			      << "\t\t" << params.status << "_" << params.ids.at(&*sUP)
 			      << ".resize(g.getMaxStamp().get() + 1);\n";
 		}
 	};
 
-	/* Print only a "visitCoherenceFull(G)" for the constraint */
+	/* Print only a "visitCoherenceRelinche(G)" for the constraint */
 	hpp() << "\tbool "
-	      << "visit" << prefix << "Full() const;\n"
+	      << "visit" << prefix << "Relinche(const ExecutionGraph &g) const;\n"
 	      << "\n";
-	cpp() << "bool " << className << "::visit" << prefix << "Full() const\n"
+	cpp() << "bool " << className << "::visit" << prefix
+	      << "Relinche(const ExecutionGraph &g) const\n"
 	      << "{\n";
-	printInitializations();
-	cpp() << "\treturn true";
 	for (auto &sUP : nfa.accepting()) {
-		cpp() << "\n\t\t&& std::ranges::all_of(labels(g), [&](auto &lab){ return ";
+		cpp() << "\tfor (auto &lab : g.labels()) {\n"
+		      << "\t\tif (!genmc::isa<MethodBeginLabel>(&lab)) continue;\n";
+		printInitializations();
+		cpp() << "\t\tif (true ";
 		if (params.visit.at(&*sUP)) {
-			cpp() << params.status << "_" << params.ids.at(&*sUP)
-			      << "[lab.getStamp().get()]"
-			      << ".status != NodeStatus::unseen || ";
+			cpp() << "&& " << params.status << params.ids.at(&*sUP)
+			      << "[lab.getStamp().get()] == NodeStatus::unseen ";
 		}
-		cpp() << params.name << "_" << params.ids.at(&*sUP) << "(&lab); })";
+		cpp() << "&& !" << params.name << "_" << params.ids.at(&*sUP) << "(&lab, &lab))\n"
+		      << "\t\t\treturn false;\n";
+		cpp() << "\t}\n";
 	}
-	cpp() << ";\n"
+	cpp() << "\treturn true;\n"
 	      << "}\n"
 	      << "\n";
 }
@@ -1436,9 +1416,10 @@ void GenMCPrinter::printCalculator(const LetStatement *let, std::string prefix, 
 	cpp() << paramType << " " << className << "::visit" << prefix
 	      << "(const EventLabel *lab) const\n"
 	      << "{\n"
-	      << "\tauto &g = getGraph();\n"
+	      << "\tauto &g = *lab->getParent();\n"
 	      << "\t" << paramType << " calcRes;\n"
-	      << "\n";
+	      << "\n"
+	      << (isView ? "calcRes.updateIdx(lab->getPos());\n" : "FIXME") << "\n";
 	for (auto &sUP :
 	     nfa.states() | std::views::filter([&](auto &sUP) { return params.visit.at(&*sUP); })) {
 		cpp() << "\t" << params.status << "_" << params.ids.at(&*sUP) << ".clear();\n"
@@ -1489,20 +1470,20 @@ void GenMCPrinter::printPPoRfCpp(const NFA &nfa, bool deps)
 		cpp() << (deps ? "DepView " : "View ") << className
 		      << "::calcPPoRfBefore(const EventLabel *lab) const\n"
 		      << "{\n"
-		      << "\tauto &g = getGraph();\n"
+		      << "\tauto &g = *lab->getParent();\n"
 		      << "\tView pporf;\n"
 		      << "\tpporf.updateIdx(lab->getPos());\n"
 		      << "\n"
-		      << "\tauto *pLab = g.getPreviousLabel(lab);\n"
+		      << "\tauto *pLab = g.po_imm_pred(lab);\n"
 		      << "\tif (!pLab)\n"
 		      << "\t\treturn pporf;\n"
 		      << "\tpporf.update(pLab->getPrefixView());\n"
-		      << "\tif (auto *rLab = llvm::dyn_cast<ReadLabel>(pLab))\n"
+		      << "\tif (auto *rLab = genmc::dyn_cast<ReadLabel>(pLab))\n"
 		      << "\t\tpporf.update(rLab->getRf()->getPrefixView());\n"
-		      << "\tif (auto *tsLab = llvm::dyn_cast<ThreadStartLabel>(pLab))\n"
-		      << "\t\tpporf.update(g.getEventLabel(tsLab->getParentCreate())->"
-			 "getPrefixView());\n"
-		      << "\tif (auto *tjLab = llvm::dyn_cast<ThreadJoinLabel>(pLab))\n"
+		      << "\tauto *tsLab = genmc::dyn_cast<ThreadStartLabel>(pLab);\n"
+		      << "\tif (tsLab && tsLab->getCreate())\n"
+		      << "\t\tpporf.update(tsLab->getCreate()->getPrefixView());\n"
+		      << "\tif (auto *tjLab = genmc::dyn_cast<ThreadJoinLabel>(pLab))\n"
 		      << "\t\tpporf.update(g.getLastThreadLabel(tjLab->getChildId())->"
 			 "getPrefixView());\n"
 		      << "\treturn pporf;\n"
@@ -1517,7 +1498,7 @@ void GenMCPrinter::printPPoRfCpp(const NFA &nfa, bool deps)
 		      << "(const EventLabel *lab, " << (deps ? "DepView" : "View")
 		      << " &pporf) const\n"
 		      << "{\n"
-		      << "\tauto &g = getGraph();\n"
+		      << "\tauto &g = *lab->getParent();\n"
 		      << "\n"
 		      << "\tvisitedPPoRf" << ids[&*s]
 		      << "[lab->getStamp().get()] = NodeStatus::entered;\n";
@@ -1543,7 +1524,7 @@ void GenMCPrinter::printPPoRfCpp(const NFA &nfa, bool deps)
 	cpp() << (deps ? "DepView " : "View ") << className
 	      << "::calcPPoRfBefore(const EventLabel *lab) const\n"
 	      << "{\n"
-	      << "\tauto &g = getGraph();\n"
+	      << "\tauto &g = *lab->getParent();\n"
 	      << "\t" << (deps ? "DepView" : "View") << " pporf;\n"
 	      << "\tpporf.updateIdx(lab->getPos());\n";
 	std::for_each(nfa.states_begin(), nfa.states_end(), [&](auto &s) {

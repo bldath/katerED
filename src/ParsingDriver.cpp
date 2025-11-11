@@ -87,7 +87,7 @@ auto ParsingDriver::parse(const std::string &name) -> int
 	if (states.size() == 1) {
 		auto *module = getModule();
 		auto *ppoLet = module->getRegisteredStatement(getQualifiedName("ppo"));
-		auto *hbLet = module->getRegisteredStatement(getQualifiedName("hb_stable"));
+		auto *hbLet = module->getRegisteredStatement(getQualifiedName("hb"));
 		module->registerPPO(ppoLet);
 		module->registerHB(hbLet);
 	}
@@ -323,7 +323,8 @@ void ParsingDriver::registerRecDerived(
 }
 
 void ParsingDriver::registerRecViewDerived(
-	std::vector<std::pair<std::string, std::unique_ptr<RegExp>>> defs, const yy::location &loc)
+	std::vector<std::pair<std::string, std::unique_ptr<RegExp>>> defs, std::string codeToPrint,
+	const yy::location &loc)
 {
 	checkMutRecDeclaration(defs, loc);
 
@@ -344,7 +345,7 @@ void ParsingDriver::registerRecViewDerived(
 		auto mutRecRE = MutRecRE::createOpt(rel, rels, extractREs(defs));
 		getModule()->registerLet(LetStatement::create(
 			getQualifiedName(name), std::move(mutRecRE), ViewExp::create(re->clone()),
-			DbgInfo(loc.end.filename, loc.end.line)));
+			DbgInfo(loc.end.filename, loc.end.line), codeToPrint));
 	}
 	clearTmpRecursive();
 }

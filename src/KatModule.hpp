@@ -45,13 +45,15 @@ public:
 	{
 		return PlusRE::createOpt(AltRE::createOpt(
 			getPPODeclaration()->getRE()->clone(), getRegisteredRE("rfe")->clone(),
-			getRegisteredRE("tc")->clone(), getRegisteredRE("tj")->clone()));
+			getRegisteredRE("tc")->clone(), getRegisteredRE("tj")->clone(),
+			getRegisteredRE("lin")->clone()));
 	}
 	auto createPORF() const -> std::unique_ptr<RegExp>
 	{
 		return PlusRE::createOpt(AltRE::createOpt(
 			getRegisteredRE("po")->clone(), getRegisteredRE("rfe")->clone(),
-			getRegisteredRE("tc")->clone(), getRegisteredRE("tj")->clone()));
+			getRegisteredRE("tc")->clone(), getRegisteredRE("tj")->clone(),
+			getRegisteredRE("lin")->clone()));
 	}
 
 	auto getTheory() const -> const Theory & { return theory_; }

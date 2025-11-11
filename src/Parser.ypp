@@ -128,7 +128,7 @@
 %printer { yyo << *($$); } <std::unique_ptr<Constraint>>;
 %printer { yyo << "<" << ($$).first << ", " << *($$).second; } <std::pair<std::string, std::unique_ptr<RegExp>>>;
 %printer { for (auto &s : $$) yyo << s.first << *s.second << " "; } <std::vector<std::pair<std::string, std::unique_ptr<RegExp>>>>;
-%printer { yyo << $$.has_value() ? *$$ : ""; } <std::optional<std::string>>;
+%printer { yyo << ($$.has_value() ? *$$ : ""); } <std::optional<std::string>>;
 %printer { yyo << $$; } <*>;
 
 %start main
@@ -144,8 +144,8 @@ decl:     "include" QSTRING                { drv.parse($2.substr(1, $2.size()-2)
 	| "disjoint" pred_list             { drv.registerDisjointPreds($2); }
 	| "let" def                        { drv.registerDerived(LetStatement::create(std::move($2.first), std::move($2.second), NoSavedExp::create(), DbgInfo(@$.end.filename, @$.end.line)), @$); }
 	| "let" "rec" def_list             { drv.registerRecDerived(std::move($3), @$);	}
-	| "view" def			   { drv.registerViewDerived(LetStatement::create(std::move($2.first), $2.second->clone(), ViewExp::create($2.second->clone()), DbgInfo(@$.end.filename, @$.end.line)), @$); }
-	| "view" "rec" def_list		   { drv.registerRecViewDerived(std::move($3), @$); }
+	| "view" def print_ID		   { drv.registerViewDerived(LetStatement::create(std::move($2.first), $2.second->clone(), ViewExp::create($2.second->clone()), DbgInfo(@$.end.filename, @$.end.line), std::move($3)), @$); }
+	| "view" "rec" def_list	print_ID   { drv.registerRecViewDerived(std::move($3), std::move($4), @$); }
 	| "assume" assume_constraint	   { drv.registerAssume(AssumeStatement::create(std::move($2), false)); }
 	| "assert" assert_constraint	   { drv.registerAssert(AssertStatement::create(std::move($2), DbgInfo(@$.end.filename, @$.end.line))); }
 	| "export" as_extra_opt export_constraint unless_opt print_ID { drv.registerExport(ExportStatement::create(std::move($3), std::move($4), std::move($5), std::move($2)), @$); }

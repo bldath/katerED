@@ -30,7 +30,7 @@
  **                           RelationInfo Class
  ******************************************************************************/
 
-enum class RelArity { Unknown, OneOne, ManyOne, OneMany, UnsuppMany, Conj, Final };
+enum class RelArity { Unknown, OneOne, ManyOne, OneMany, ManyMany, UnsuppMany, Conj, Final };
 enum class RelLocInfo { Unknown, ChangesLoc, KeepsLoc };
 struct RelExport {
 	std::string succ;
@@ -71,6 +71,8 @@ public:
 		/* tc, tj */
 		tc,
 		tj,
+		/* linearization */
+		lin,
 		/* rf, co, fr, rmw */
 		PerLocBegin,
 		rf,

@@ -85,9 +85,10 @@ class LetStatement : public Statement {
 
 protected:
 	LetStatement(std::string name, std::unique_ptr<RegExp> exp, std::unique_ptr<SavedExp> saved,
-		     std::optional<DbgInfo> dbg)
+		     std::optional<DbgInfo> dbg, std::string codeToPrint = "")
 		: Statement(nullptr), id_(dispenser++), name_(std::move(name)),
-		  exp_(std::move(exp)), saved_(std::move(saved)), dbg_(std::move(dbg))
+		  exp_(std::move(exp)), saved_(std::move(saved)), dbg_(std::move(dbg)),
+		  codeToPrint_(std::move(codeToPrint))
 	{
 	}
 
@@ -121,6 +122,17 @@ public:
 
 	void setSaved(std::unique_ptr<SavedExp> saved) { saved_ = std::move(saved); }
 
+	/** Returns the code to be printed for this statement during export (if any) */
+	auto getCodeToPrint() -> std::optional<std::string> & { return codeToPrint_; }
+	[[nodiscard]] auto getCodeToPrint() const -> const std::optional<std::string> &
+	{
+		return codeToPrint_;
+	}
+
+	[[nodiscard]] auto hasCodeToPrint() const -> bool { return codeToPrint_.has_value(); }
+
+	void setCodeToPrint(std::string code) { codeToPrint_ = std::move(code); }
+
 	/** Returns the debug info associated with the let */
 	[[nodiscard]] auto getDbgInfo() const -> const std::optional<DbgInfo> & { return dbg_; }
 
@@ -142,6 +154,7 @@ private:
 	std::unique_ptr<RegExp> exp_{};
 	std::unique_ptr<SavedExp> saved_{};
 	std::optional<DbgInfo> dbg_{};
+	std::optional<std::string> codeToPrint_{};
 
 	/* A unique ID for each let statement */
 	static inline unsigned

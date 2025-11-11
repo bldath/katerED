@@ -75,11 +75,17 @@ public:
 		ALLOC,
 		FREE,
 		HPRET,
+		PROT,
 		HPPROT,
 		NOTHPPROT,
 		/* Locking */
 		LK,
 		UL,
+		PLK,
+		NPLK,
+		/* Method calls */
+		MB,
+		ME,
 		/* Others */
 		HEAP,
 		REC,
